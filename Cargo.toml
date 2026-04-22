@@ -1,0 +1,10 @@
+[package]
+name = "sd-conf"
+version = "0.1.0"
+edition = "2021"
+description = "Read systemd-style INI configuration files with drop-in override support"
+
+[dependencies]
+thiserror = "2"
+
+[lib]
