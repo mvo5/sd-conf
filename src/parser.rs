@@ -10,6 +10,7 @@ pub(crate) struct Entry {
     pub section: String,
     pub key: String,
     pub value: String,
+    pub line: u32,
 }
 
 pub(crate) fn parse_file(path: &Path) -> Result<Vec<Entry>, Error> {
@@ -156,6 +157,7 @@ fn process_logical(
         section: section.clone(),
         key: key.to_string(),
         value: v.trim().to_string(),
+        line: line_no,
     });
     Ok(())
 }

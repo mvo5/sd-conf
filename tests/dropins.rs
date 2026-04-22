@@ -141,6 +141,43 @@ fn dropins_apply_in_lexical_order() {
 }
 
 #[test]
+fn get_bool_happy_path() {
+    let root = TempRoot::new("bool-ok");
+    root.write(
+        "etc/foo/main.conf",
+        "[Settings]\nenabled=yes\ndisabled=0\nmissing_in_other_files=on\n",
+    );
+
+    let paths = SearchPaths::standard_with_root("foo", root.path());
+    let cfg = Config::load("main.conf", &paths).expect("load");
+
+    assert_eq!(cfg.get_bool("Settings", "enabled").unwrap(), Some(true));
+    assert_eq!(cfg.get_bool("Settings", "disabled").unwrap(), Some(false));
+    assert_eq!(
+        cfg.get_bool("Settings", "missing_in_other_files").unwrap(),
+        Some(true)
+    );
+    assert_eq!(cfg.get_bool("Settings", "never_mentioned").unwrap(), None);
+}
+
+#[test]
+fn get_bool_reports_source_and_line_on_error() {
+    let root = TempRoot::new("bool-err");
+    // Two lines, bad bool is on line 2.
+    root.write("etc/foo/main.conf", "[Settings]\nenabled=maybe\n");
+
+    let paths = SearchPaths::standard_with_root("foo", root.path());
+    let cfg = Config::load("main.conf", &paths).expect("load");
+
+    let err = cfg.get_bool("Settings", "enabled").unwrap_err();
+    let expected = format!(
+        "{}/etc/foo/main.conf:2: [Settings] enabled: invalid boolean (expected yes/no/true/false/on/off/y/n/t/f/1/0)",
+        root.path().display()
+    );
+    assert_eq!(err.to_string(), expected);
+}
+
+#[test]
 fn non_conf_extension_ignored_in_dropin_dir() {
     let root = TempRoot::new("bad-ext");
     root.write("etc/foo/main.conf.d/a.conf", "[S]\nkey=yes\n");

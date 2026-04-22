@@ -16,6 +16,7 @@ struct Merged {
     key: String,
     value: String,
     source: PathBuf,
+    line: u32,
 }
 
 impl Config {
@@ -50,7 +51,8 @@ impl Config {
                 let key = (e.section.clone(), e.key.clone());
                 if let Some(&i) = index.get(&key) {
                     entries[i].value = e.value;
-                    entries[i].source = path.clone();
+                    entries[i].source.clone_from(&path);
+                    entries[i].line = e.line;
                 } else {
                     index.insert(key, entries.len());
                     entries.push(Merged {
@@ -58,6 +60,7 @@ impl Config {
                         key: e.key,
                         value: e.value,
                         source: path.clone(),
+                        line: e.line,
                     });
                 }
             }
@@ -74,6 +77,34 @@ impl Config {
     #[must_use]
     pub fn get(&self, section: &str, key: &str) -> Option<&str> {
         self.lookup(section, key).map(|m| m.value.as_str())
+    }
+
+    /// Final value interpreted as a boolean. Accepts the same spellings as
+    /// systemd (`parse_boolean` in src/basic/parse-util.c):
+    /// `1`/`yes`/`y`/`true`/`t`/`on` and `0`/`no`/`n`/`false`/`f`/`off`
+    /// (case-insensitive except for `0`/`1`).
+    ///
+    /// Returns `Ok(None)` when the key is unset, `Ok(Some(b))` on success,
+    /// and `Err(Error::InvalidValue)` when the key is set but unparseable.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidValue`] when the key is set to a value that
+    /// does not match any of the accepted boolean spellings.
+    pub fn get_bool(&self, section: &str, key: &str) -> Result<Option<bool>, Error> {
+        let Some(m) = self.lookup(section, key) else {
+            return Ok(None);
+        };
+        if let Some(b) = parse_bool(&m.value) {
+            return Ok(Some(b));
+        }
+        Err(Error::InvalidValue {
+            path: m.source.clone(),
+            line: m.line,
+            section: m.section.clone(),
+            key: m.key.clone(),
+            reason: "invalid boolean (expected yes/no/true/false/on/off/y/n/t/f/1/0)",
+        })
     }
 
     /// File that provided the current value. Useful for diagnostics.
@@ -101,5 +132,44 @@ impl Config {
         // HashMap requires an owned key; a small allocation is fine here.
         let k = (section.to_string(), key.to_string());
         self.index.get(&k).map(|&i| &self.entries[i])
+    }
+}
+
+/// Matches systemd's `parse_boolean` (src/basic/parse-util.c).
+fn parse_bool(s: &str) -> Option<bool> {
+    match s.to_ascii_lowercase().as_str() {
+        "1" | "yes" | "y" | "true" | "t" | "on" => Some(true),
+        "0" | "no" | "n" | "false" | "f" | "off" => Some(false),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_bool;
+
+    #[test]
+    fn parses_true_spellings() {
+        for s in [
+            "1", "yes", "Yes", "YES", "y", "Y", "true", "True", "t", "T", "on", "ON",
+        ] {
+            assert_eq!(parse_bool(s), Some(true), "expected true for {s:?}");
+        }
+    }
+
+    #[test]
+    fn parses_false_spellings() {
+        for s in [
+            "0", "no", "No", "NO", "n", "N", "false", "False", "f", "F", "off", "OFF",
+        ] {
+            assert_eq!(parse_bool(s), Some(false), "expected false for {s:?}");
+        }
+    }
+
+    #[test]
+    fn rejects_garbage() {
+        for s in ["", "maybe", "2", "-1", "truthy", "nope", " yes", "yes "] {
+            assert_eq!(parse_bool(s), None, "expected None for {s:?}");
+        }
     }
 }
