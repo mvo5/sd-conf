@@ -141,6 +141,19 @@ fn dropins_apply_in_lexical_order() {
 }
 
 #[test]
+fn get_string_returns_owned() {
+    let root = TempRoot::new("get-string");
+    root.write("etc/foo/main.conf", "[S]\nk=hello\n");
+
+    let paths = SearchPaths::standard_with_root("foo", root.path());
+    let cfg = Config::load("main.conf", &paths).expect("load");
+
+    let owned: Option<String> = cfg.get_string("S", "k");
+    assert_eq!(owned.as_deref(), Some("hello"));
+    assert_eq!(cfg.get_string("S", "missing"), None);
+}
+
+#[test]
 fn get_bool_happy_path() {
     let root = TempRoot::new("bool-ok");
     root.write(

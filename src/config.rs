@@ -79,6 +79,13 @@ impl Config {
         self.lookup(section, key).map(|m| m.value.as_str())
     }
 
+    /// Final value as an owned `String`. Convenience for moving values into
+    /// owned structs; prefer [`Config::get`] when a `&str` suffices.
+    #[must_use]
+    pub fn get_string(&self, section: &str, key: &str) -> Option<String> {
+        self.get(section, key).map(str::to_owned)
+    }
+
     /// Final value interpreted as a boolean. Accepts the same spellings as
     /// systemd (`parse_boolean` in src/basic/parse-util.c):
     /// `1`/`yes`/`y`/`true`/`t`/`on` and `0`/`no`/`n`/`false`/`f`/`off`
