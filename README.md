@@ -19,6 +19,21 @@ For non-standard layouts (custom directories, a chroot root, etc.) use
 `SearchPaths::new(...)` or `SearchPaths::standard_with_root(...)` and
 pass the result to `Config::load`.
 
+## Parsing a string
+
+`parse_str` parses input that is not a file on disk, for example a unit
+file embedded in another document. It returns every assignment in order,
+so a key that is assigned more than once is returned more than once:
+
+```rust
+use sd_conf::parse_str;
+
+let entries = parse_str("[Install]\nWantedBy=a.target\nWantedBy=b.target\n")?;
+for e in entries.iter().filter(|e| e.section == "Install") {
+    println!("line {}: {} = {}", e.line, e.key, e.value);
+}
+```
+
 ## Search order
 
 For project `foobar`, `main.conf` is loaded from these directories in
