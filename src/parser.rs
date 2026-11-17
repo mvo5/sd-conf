@@ -3,58 +3,68 @@
 //! Reference: systemd src/shared/conf-parser.c:282 (`config_parse`).
 
 use crate::Error;
-use std::io::{self, BufRead, BufReader};
 use std::path::Path;
 
-pub(crate) struct Entry {
+/// One `key = value` assignment of the parsed input.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Entry {
+    /// The section the assignment is in, empty before the first section
+    /// header.
     pub section: String,
     pub key: String,
     pub value: String,
+    /// The line the assignment starts on, counted from 1.
     pub line: u32,
 }
 
-pub(crate) fn parse_file(path: &Path) -> Result<Vec<Entry>, Error> {
-    let f = std::fs::File::open(path)?;
-    parse_reader(BufReader::new(f), path)
+/// Why [`parse_str`] rejected its input.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("line {line}: {reason}")]
+pub struct ParseError {
+    /// The line the rejected input starts on, counted from 1.
+    pub line: u32,
+    pub reason: &'static str,
 }
 
-pub(crate) fn parse_reader<R: BufRead>(reader: R, path: &Path) -> Result<Vec<Entry>, Error> {
+pub(crate) fn parse_file(path: &Path) -> Result<Vec<Entry>, Error> {
+    let parse_error = |line, reason| Error::Parse {
+        path: path.to_path_buf(),
+        line,
+        reason,
+    };
+    let text = String::from_utf8(std::fs::read(path)?).map_err(|e| {
+        let valid = String::from_utf8_lossy(&e.as_bytes()[..e.utf8_error().valid_up_to()]);
+        let newlines = valid.matches('\n').count();
+        parse_error(line_number(newlines), "invalid UTF-8")
+    })?;
+    parse_str(&text).map_err(|e| parse_error(e.line, e.reason))
+}
+
+/// Parse `input` in the syntax of systemd configuration and unit files.
+/// Returns every assignment in the order of the input, so a key that is
+/// assigned more than once is returned more than once.
+///
+/// # Errors
+///
+/// Returns a [`ParseError`] for a NUL byte, a section header without `]`,
+/// a line that is neither a section header nor an assignment, and an
+/// assignment without a key.
+pub fn parse_str(input: &str) -> Result<Vec<Entry>, ParseError> {
     let mut entries = Vec::new();
     let mut section = String::new();
     let mut continuation: Option<String> = None;
     let mut continuation_start: u32 = 0;
-    let mut bom_seen = false;
 
-    for (idx, line_result) in reader.lines().enumerate() {
-        let line_no: u32 = u32::try_from(idx)
-            .ok()
-            .and_then(|n| n.checked_add(1))
-            .expect("config file has more than u32::MAX lines");
-        let mut line = match line_result {
-            Ok(s) => s,
-            Err(e) if e.kind() == io::ErrorKind::InvalidData => {
-                return Err(Error::Parse {
-                    path: path.to_path_buf(),
-                    line: line_no,
-                    reason: "invalid UTF-8",
-                })
-            }
-            Err(e) => return Err(e.into()),
-        };
+    let input = input.strip_prefix('\u{FEFF}').unwrap_or(input);
+    for (idx, line) in input.lines().enumerate() {
+        let line_no = line_number(idx);
+        let line = line.to_string();
 
         if line.contains('\0') {
-            return Err(Error::Parse {
-                path: path.to_path_buf(),
+            return Err(ParseError {
                 line: line_no,
                 reason: "NUL byte in input",
             });
-        }
-
-        if !bom_seen {
-            bom_seen = true;
-            if let Some(rest) = line.strip_prefix('\u{FEFF}') {
-                line = rest.to_string();
-            }
         }
 
         // Comments: leading whitespace + `#` or `;`. Comment lines are dropped
@@ -91,27 +101,23 @@ pub(crate) fn parse_reader<R: BufRead>(reader: R, path: &Path) -> Result<Vec<Ent
             continue;
         }
 
-        process_logical(
-            &logical,
-            &mut section,
-            &mut entries,
-            continuation_start,
-            path,
-        )?;
+        process_logical(&logical, &mut section, &mut entries, continuation_start)?;
     }
 
     // File ended mid-continuation. Parse what we have.
     if let Some(logical) = continuation {
-        process_logical(
-            &logical,
-            &mut section,
-            &mut entries,
-            continuation_start,
-            path,
-        )?;
+        process_logical(&logical, &mut section, &mut entries, continuation_start)?;
     }
 
     Ok(entries)
+}
+
+/// The number of the line with the zero-based index `idx`.
+fn line_number(idx: usize) -> u32 {
+    u32::try_from(idx)
+        .ok()
+        .and_then(|n| n.checked_add(1))
+        .expect("config file has more than u32::MAX lines")
 }
 
 fn process_logical(
@@ -119,8 +125,7 @@ fn process_logical(
     section: &mut String,
     entries: &mut Vec<Entry>,
     line_no: u32,
-    path: &Path,
-) -> Result<(), Error> {
+) -> Result<(), ParseError> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
         return Ok(());
@@ -128,8 +133,7 @@ fn process_logical(
 
     if let Some(rest) = trimmed.strip_prefix('[') {
         let Some(name) = rest.strip_suffix(']') else {
-            return Err(Error::Parse {
-                path: path.to_path_buf(),
+            return Err(ParseError {
                 line: line_no,
                 reason: "section header missing ']'",
             });
@@ -139,16 +143,14 @@ fn process_logical(
     }
 
     let Some((k, v)) = trimmed.split_once('=') else {
-        return Err(Error::Parse {
-            path: path.to_path_buf(),
+        return Err(ParseError {
             line: line_no,
             reason: "expected 'key = value' or '[Section]'",
         });
     };
     let key = k.trim();
     if key.is_empty() {
-        return Err(Error::Parse {
-            path: path.to_path_buf(),
+        return Err(ParseError {
             line: line_no,
             reason: "empty key before '='",
         });
@@ -165,10 +167,9 @@ fn process_logical(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
 
     fn parse(input: &str) -> Vec<Entry> {
-        parse_reader(input.as_bytes(), &PathBuf::from("<test>")).expect("parse ok")
+        parse_str(input).expect("parse ok")
     }
 
     fn setting1(input: &str) -> Option<String> {
@@ -302,14 +303,13 @@ setting1=3
     #[test]
     fn nul_byte_rejected() {
         let input = "[Section]\nsetting1=\0foo\n";
-        let r = parse_reader(input.as_bytes(), &PathBuf::from("<test>"));
-        assert!(matches!(
-            r,
-            Err(Error::Parse {
+        assert_eq!(
+            parse_str(input),
+            Err(ParseError {
+                line: 2,
                 reason: "NUL byte in input",
-                ..
             })
-        ));
+        );
     }
 
     #[test]
@@ -320,28 +320,70 @@ setting1=3
 
     #[test]
     fn unterminated_section_header_errors() {
-        let r = parse_reader(b"[Section\n".as_ref(), &PathBuf::from("<test>"));
-        assert!(matches!(r, Err(Error::Parse { reason, .. }) if reason.contains("section header")));
+        let r = parse_str("[Section\n");
+        assert!(matches!(r, Err(ParseError { reason, .. }) if reason.contains("section header")));
     }
 
     #[test]
     fn missing_equals_errors() {
-        let r = parse_reader(
-            b"[Section]\njust_a_word\n".as_ref(),
-            &PathBuf::from("<test>"),
-        );
-        assert!(matches!(r, Err(Error::Parse { .. })));
+        assert!(parse_str("[Section]\njust_a_word\n").is_err());
     }
 
     #[test]
     fn empty_key_errors() {
-        let r = parse_reader(b"[Section]\n=value\n".as_ref(), &PathBuf::from("<test>"));
-        assert!(matches!(
-            r,
-            Err(Error::Parse {
+        assert_eq!(
+            parse_str("[Section]\n=value\n"),
+            Err(ParseError {
+                line: 2,
                 reason: "empty key before '='",
-                ..
             })
-        ));
+        );
+    }
+
+    #[test]
+    fn repeated_keys_are_all_returned_in_order() {
+        let input = "before=x\n[Install]\nWantedBy=a.target \\\n  b.target\nWantedBy=\n";
+        let entry = |section: &str, key: &str, value: &str, line| Entry {
+            section: section.to_string(),
+            key: key.to_string(),
+            value: value.to_string(),
+            line,
+        };
+        assert_eq!(
+            parse(input),
+            [
+                entry("", "before", "x", 1),
+                entry("Install", "WantedBy", "a.target    b.target", 3),
+                entry("Install", "WantedBy", "", 5),
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_error_names_the_line() {
+        let err = parse_str("[Section]\n\njust_a_word\n").unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "line 3: expected 'key = value' or '[Section]'"
+        );
+    }
+
+    #[test]
+    fn parse_file_reports_path_and_line() {
+        let dir = std::env::temp_dir().join(format!("sd-conf-parser-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("bad.conf");
+
+        std::fs::write(&path, b"[Section]\nkey=\xff\n").unwrap();
+        let utf8 = parse_file(&path).unwrap_err().to_string();
+        std::fs::write(&path, "[Section]\n=value\n").unwrap();
+        let syntax = parse_file(&path).unwrap_err().to_string();
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        assert_eq!(utf8, format!("{}:2: invalid UTF-8", path.display()));
+        assert_eq!(
+            syntax,
+            format!("{}:2: empty key before '='", path.display())
+        );
     }
 }
